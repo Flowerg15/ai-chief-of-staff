@@ -2,8 +2,8 @@
 Anthropic Claude API client.
 
 Model routing:
-- claude-sonnet-4-6: Fast queries, inbox triage, simple drafts
-- claude-opus-4-6: Complex reasoning, ambiguous queries, tone calibration
+- claude-sonnet-4-20250514: Fast queries, inbox triage, simple drafts
+- claude-opus-4-20250514: Complex reasoning, ambiguous queries, tone calibration
 """
 import structlog
 from anthropic import AsyncAnthropic
@@ -16,8 +16,8 @@ logger = structlog.get_logger(__name__)
 settings = get_settings()
 
 # Model constants
-SONNET = "claude-sonnet-4-6"
-OPUS = "claude-opus-4-6"
+SONNET = "claude-sonnet-4-20250514"
+OPUS = "claude-opus-4-20250514"
 
 _client: AsyncAnthropic | None = None
 
@@ -82,17 +82,11 @@ async def ask_claude_complex(
     )
 
 
-async def generate_embedding(text: str) -> list[float]:
+async def generate_embedding(text: str) -> list[float] | None:
     """
     Generate a text embedding for semantic search.
-    Uses text-embedding-3-small for cost efficiency.
+    Returns None until an embedding provider is configured in Phase 2,
+    allowing the system to fall back to keyword matching.
     """
-    import openai
-    # Note: embeddings use OpenAI's API via Supabase's built-in support
-    # For simplicity in V1, we'll use a hash-based fallback or skip embeddings
-    # and add proper embedding generation in Phase 2.
-    # For now, return a placeholder.
-    raise NotImplementedError(
-        "Embedding generation not configured. "
-        "Add your embedding provider in Phase 2."
-    )
+    logger.debug("Embedding generation skipped (Phase 2)", text_preview=text[:80])
+    return None

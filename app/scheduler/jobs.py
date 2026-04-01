@@ -2,9 +2,8 @@
 APScheduler setup.
 Fires the daily brief at configured times.
 """
-import asyncio
 import structlog
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.config import get_settings
@@ -12,7 +11,7 @@ from app.config import get_settings
 logger = structlog.get_logger(__name__)
 settings = get_settings()
 
-_scheduler: BackgroundScheduler | None = None
+_scheduler: AsyncIOScheduler | None = None
 
 
 def _parse_time(time_str: str) -> tuple[int, int]:
@@ -21,27 +20,24 @@ def _parse_time(time_str: str) -> tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
-def _run_brief():
-    """Sync wrapper to run the async brief in the scheduler thread."""
+async def _run_brief():
+    """Run the async brief directly on the event loop."""
     from app.workflows.brief import generate_and_send_brief
     from app.telegram.bot import send_message
 
-    async def _run():
+    try:
+        await generate_and_send_brief()
+    except Exception as e:
+        logger.error("Scheduled brief failed", error=str(e))
         try:
-            await generate_and_send_brief()
-        except Exception as e:
-            logger.error("Scheduled brief failed", error=str(e))
-            try:
-                await send_message(f"⚠️ *SYSTEM ALERT*: Daily brief failed.\n`{str(e)[:300]}`")
-            except Exception:
-                pass  # Don't let the alert itself crash the scheduler
-
-    asyncio.run(_run())
+            await send_message(f"⚠️ *SYSTEM ALERT*: Daily brief failed.\n`{str(e)[:300]}`")
+        except Exception:
+            pass  # Don't let the alert itself crash the scheduler
 
 
 def start_scheduler() -> None:
     global _scheduler
-    _scheduler = BackgroundScheduler(timezone=settings.timezone)
+    _scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
     morning_hour, morning_min = _parse_time(settings.brief_time_morning)
     afternoon_hour, afternoon_min = _parse_time(settings.brief_time_afternoon)

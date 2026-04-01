@@ -72,8 +72,7 @@ async def handle_telegram_update(body: dict) -> None:
         logger.warning("Blocked update from unknown chat", chat_id=chat_id)
         return
 
-    async with app:
-        await app.process_update(update)
+    await app.process_update(update)
 
 
 async def send_message(text: str, parse_mode: str = "Markdown") -> None:

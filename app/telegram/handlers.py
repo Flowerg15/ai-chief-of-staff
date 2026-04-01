@@ -64,7 +64,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             response = await ask_claude(text)
 
-        await processing_msg.edit_text(response, parse_mode="Markdown")
+        if response:
+            await processing_msg.edit_text(response, parse_mode="Markdown")
+        else:
+            await processing_msg.delete()
 
     except Exception as e:
         logger.error("Handler error", error=str(e), intent=text[:60])
@@ -165,11 +168,48 @@ async def _handle_draft(text: str, update: Update) -> str:
 
 async def _handle_memory_update(text: str) -> str:
     """Parse a memory update instruction and apply it to the database."""
+    import json
+
     prompt = (
         f"The user wants to update memory: '{text}'\n\n"
-        "Identify what needs to be updated (contact, deal, or note) and confirm what you're saving."
+        "Extract the update as JSON with keys: table (contacts|deals|notes), "
+        "identifier (name or email to match), and fields (dict of columns to set).\n"
+        "Also include a confirmation message in a 'message' key.\n"
+        "Return ONLY valid JSON, no markdown."
     )
-    return await ask_claude(prompt)
+    raw = await ask_claude(prompt)
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return await ask_claude(
+            f"The user wants to update memory: '{text}'\n\n"
+            "Identify what needs to be updated (contact, deal, or note) and confirm what you're saving."
+        )
+
+    table = parsed.get("table", "contacts")
+    identifier = parsed.get("identifier", "")
+    fields = parsed.get("fields", {})
+    confirmation = parsed.get("message", "Memory updated.")
+
+    if not identifier or not fields:
+        return confirmation
+
+    client = get_supabase()
+    if table == "contacts":
+        client.table("contacts").update(fields).eq("email", identifier).execute()
+    elif table == "deals":
+        client.table("deals").update(fields).eq("name", identifier).execute()
+    elif table == "notes":
+        from datetime import datetime, timezone
+        client.table("decisions").insert({
+            "context": identifier,
+            "decision": json.dumps(fields),
+            "rationale": text,
+            "date": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+
+    return f"✅ {confirmation}"
 
 
 async def _execute_send(draft_id: str, query) -> None:
