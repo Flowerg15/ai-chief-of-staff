@@ -1,0 +1,34 @@
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# Telegram
+python-telegram-bot==21.5
+
+# Google / Gmail
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+google-api-python-client==2.149.0
+
+# Anthropic
+anthropic==0.34.2
+
+# Supabase
+supabase==2.9.0
+vecs==0.4.3
+
+# Scheduling
+apscheduler==3.10.4
+
+# Config
+pydantic-settings==2.5.2
+pydantic==2.9.2
+python-dotenv==1.0.1
+
+# Utilities
+httpx==0.27.2
+tenacity==9.0.0
+structlog==24.4.0
+python-multipart==0.0.12
+aiofiles==24.1.0

@@ -1,0 +1,31 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    secrets:
+      - supabase_service_key
+      - anthropic_api_key
+      - telegram_bot_token
+    volumes:
+      - gmail_tokens:/app/tokens   # fallback local token storage (pre-Supabase)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+secrets:
+  supabase_service_key:
+    environment: SUPABASE_SERVICE_KEY
+  anthropic_api_key:
+    environment: ANTHROPIC_API_KEY
+  telegram_bot_token:
+    environment: TELEGRAM_BOT_TOKEN
+
+volumes:
+  gmail_tokens:
