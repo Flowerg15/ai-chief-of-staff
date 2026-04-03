@@ -10,42 +10,29 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # Telegram
     telegram_bot_token: str
     telegram_chat_id: int
     telegram_webhook_secret: str
-
-    # Anthropic
     anthropic_api_key: str
-
-    # Supabase
     supabase_url: str
     supabase_service_key: str
-
-    # Gmail
     gmail_client_id: str
     gmail_client_secret: str
     gmail_user_email: str
-
-    # Server
     app_host: str = "0.0.0.0"
     app_port: int = 8000
-    public_url: str  # Must be HTTPS for Telegram webhooks
-
-    # Scheduling
+    public_url: str
     brief_time_morning: str = "07:30"
     brief_time_afternoon: str = "13:00"
     timezone: str = "America/New_York"
-
-    # App
     debug: bool = False
     log_level: str = "INFO"
 
     @field_validator("public_url")
     @classmethod
     def url_must_be_https(cls, v: str) -> str:
-        if not v.startswith("https://"):
-            raise ValueError("PUBLIC_URL must start with https://")
+        if not v.startswith("https://") and not v.startswith("http://localhost"):
+            raise ValueError("PUBLIC_URL must start with https:// (or http://localhost for local dev)")
         return v.rstrip("/")
 
     @property
