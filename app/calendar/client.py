@@ -192,6 +192,60 @@ async def create_event(
     return result
 
 
+async def delete_event(event_id: str) -> bool:
+    """Delete a calendar event by ID."""
+    try:
+        service = await _get_service()
+        service.events().delete(
+            calendarId="primary",
+            eventId=event_id,
+            sendUpdates="all",
+        ).execute()
+        logger.info("Calendar event deleted", event_id=event_id)
+        return True
+    except HttpError as e:
+        logger.error("Failed to delete event", event_id=event_id, error=str(e))
+        raise RuntimeError(f"Couldn't delete event: {str(e)[:200]}")
+
+
+async def decline_event(event_id: str) -> bool:
+    """Decline a calendar event (set own response to 'declined')."""
+    try:
+        service = await _get_service()
+        settings = get_settings()
+        owner_email = settings.gmail_user_email
+
+        # Get the event first
+        event = service.events().get(
+            calendarId="primary",
+            eventId=event_id,
+        ).execute()
+
+        # Update own attendee status to declined
+        attendees = event.get("attendees", [])
+        for attendee in attendees:
+            if attendee.get("email", "").lower() == owner_email.lower() or attendee.get("self"):
+                attendee["responseStatus"] = "declined"
+                break
+        else:
+            # Owner not in attendee list — just delete it
+            return await delete_event(event_id)
+
+        event["attendees"] = attendees
+        service.events().update(
+            calendarId="primary",
+            eventId=event_id,
+            body=event,
+            sendUpdates="all",
+        ).execute()
+
+        logger.info("Calendar event declined", event_id=event_id)
+        return True
+    except HttpError as e:
+        logger.error("Failed to decline event", event_id=event_id, error=str(e))
+        raise RuntimeError(f"Couldn't decline event: {str(e)[:200]}")
+
+
 def format_events_for_context(events: list[dict]) -> str:
     """Format calendar events into a readable context block for Claude."""
     if not events:

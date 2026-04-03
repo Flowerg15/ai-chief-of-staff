@@ -267,6 +267,9 @@ def _classify_intent(text: str) -> str:
         "call invite", "meeting invite", "invite to", "call with", "meeting with",
         "set up a meeting", "book a call", "schedule a call", "schedule a meeting",
         "create a call", "create a meeting", "send a call", "send an invite",
+        "delete event", "cancel event", "cancel meeting", "cancel call", "remove event",
+        "decline", "reject", "decline invite", "reject invite", "decline meeting",
+        "delete the call", "cancel the call", "remove the meeting",
     ]
 
     # Edit-last-draft detection
@@ -296,8 +299,20 @@ def _classify_intent(text: str) -> str:
 
 
 async def _handle_calendar(text: str) -> str:
-    """Handle calendar queries — show today's events, upcoming, or create new events."""
+    """Handle calendar queries — show today's events, upcoming, create, delete, or decline."""
     text_lower = text.lower()
+
+    # Check if this is a delete/cancel request
+    delete_keywords = ["delete", "cancel", "remove"]
+    is_delete = any(k in text_lower for k in delete_keywords)
+    if is_delete:
+        return await _handle_delete_event(text)
+
+    # Check if this is a decline/reject request
+    decline_keywords = ["decline", "reject"]
+    is_decline = any(k in text_lower for k in decline_keywords)
+    if is_decline:
+        return await _handle_decline_event(text)
 
     # Check if this is a "create event" request
     create_keywords = [
@@ -440,6 +455,99 @@ async def _handle_create_event(text: str) -> str:
     except Exception as e:
         logger.error("Event creation failed", error=str(e))
         return f"⚠️ Couldn't create event: `{str(e)[:200]}`"
+
+
+async def _handle_delete_event(text: str) -> str:
+    """Find and delete/cancel a calendar event based on natural language."""
+    from app.calendar.client import get_todays_events, get_upcoming_events, list_events, delete_event
+    from zoneinfo import ZoneInfo
+    from app.config import get_settings
+
+    settings = get_settings()
+    tz = ZoneInfo(settings.timezone)
+
+    # Fetch upcoming events (next 7 days) to match against
+    now = datetime.now(tz)
+    end = now + timedelta(days=7)
+    events = await list_events(now, end)
+
+    if not events:
+        return "📅 No upcoming events to delete."
+
+    # Ask Claude to identify which event the user wants to delete
+    events_list = "\n".join(
+        f"- ID: {e['id']} | {e['start']}–{e['end']} | {e['summary']} | "
+        f"Attendees: {', '.join(a['name'] for a in e['attendees']) if e['attendees'] else 'none'}"
+        for e in events
+    )
+
+    match_prompt = (
+        f"The user said: '{text}'\n\n"
+        f"Here are the upcoming calendar events:\n{events_list}\n\n"
+        "Which event ID is the user referring to? Return ONLY the event ID string, nothing else. "
+        "If you can't determine which event, return 'UNCLEAR'."
+    )
+
+    event_id = (await ask_claude(match_prompt, max_tokens=100)).strip().strip('"').strip("'")
+
+    if event_id == "UNCLEAR" or not event_id:
+        return "I'm not sure which event you want to delete. Can you be more specific? E.g., 'Cancel the call with Flower tomorrow'"
+
+    # Find the event name for confirmation
+    event_name = next((e["summary"] for e in events if e["id"] == event_id), "event")
+
+    try:
+        await delete_event(event_id)
+        return f"🗑️ *Deleted:* {event_name}"
+    except Exception as e:
+        logger.error("Delete event failed", error=str(e))
+        return f"⚠️ Couldn't delete event: `{str(e)[:200]}`"
+
+
+async def _handle_decline_event(text: str) -> str:
+    """Find and decline a calendar event based on natural language."""
+    from app.calendar.client import get_todays_events, get_upcoming_events, list_events, decline_event
+    from zoneinfo import ZoneInfo
+    from app.config import get_settings
+
+    settings = get_settings()
+    tz = ZoneInfo(settings.timezone)
+
+    # Fetch upcoming events (next 7 days) to match against
+    now = datetime.now(tz)
+    end = now + timedelta(days=7)
+    events = await list_events(now, end)
+
+    if not events:
+        return "📅 No upcoming events to decline."
+
+    # Ask Claude to identify which event
+    events_list = "\n".join(
+        f"- ID: {e['id']} | {e['start']}–{e['end']} | {e['summary']} | "
+        f"Attendees: {', '.join(a['name'] for a in e['attendees']) if e['attendees'] else 'none'}"
+        for e in events
+    )
+
+    match_prompt = (
+        f"The user said: '{text}'\n\n"
+        f"Here are the upcoming calendar events:\n{events_list}\n\n"
+        "Which event ID is the user referring to? Return ONLY the event ID string, nothing else. "
+        "If you can't determine which event, return 'UNCLEAR'."
+    )
+
+    event_id = (await ask_claude(match_prompt, max_tokens=100)).strip().strip('"').strip("'")
+
+    if event_id == "UNCLEAR" or not event_id:
+        return "I'm not sure which event you want to decline. Can you be more specific? E.g., 'Decline the meeting with Doug on Friday'"
+
+    event_name = next((e["summary"] for e in events if e["id"] == event_id), "event")
+
+    try:
+        await decline_event(event_id)
+        return f"👎 *Declined:* {event_name}"
+    except Exception as e:
+        logger.error("Decline event failed", error=str(e))
+        return f"⚠️ Couldn't decline event: `{str(e)[:200]}`"
 
 
 async def _handle_summarise(text: str) -> str:
