@@ -23,6 +23,7 @@ from app.workflows.inbox import (
     _load_active_deals,
     _format_emails_for_claude,
 )
+from app.calendar.client import get_todays_events, format_events_for_context
 
 logger = structlog.get_logger(__name__)
 
@@ -54,6 +55,15 @@ async def generate_and_send_brief() -> None:
     deals = []
     stale_threads = []
     pre_drafts = []
+    calendar_events = []
+
+    # Step 0: Fetch today's calendar
+    try:
+        calendar_events = await get_todays_events()
+        logger.info("Calendar events loaded", count=len(calendar_events))
+    except Exception as e:
+        errors.append(f"Calendar fetch failed: {e}")
+        logger.error("Brief: calendar fetch failed", error=str(e))
 
     # Step 1: Fetch stale threads (waiting on Garret)
     try:
@@ -105,9 +115,13 @@ async def generate_and_send_brief() -> None:
         # Format new emails
         email_text = _format_emails_for_claude(emails) if emails else "No new emails in the last 24 hours."
 
+        # Format calendar
+        calendar_section = format_events_for_context(calendar_events) if calendar_events else "No events today."
+
         prompt = (
             f"Generate the daily executive brief.\n\n"
             f"Title: {brief_title}\n\n"
+            f"=== TODAY'S CALENDAR ===\n{calendar_section}\n\n"
             f"=== THREADS WAITING ON GARRET ===\n{stale_section}\n\n"
             f"=== NEW EMAILS (last 24h): {len(emails)} ===\n{email_text}\n\n"
         )

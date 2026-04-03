@@ -6,6 +6,7 @@ Maintains full conversation history in Supabase for multi-turn context.
 import asyncio
 import json
 import structlog
+from datetime import datetime, timezone, timedelta
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
@@ -168,6 +169,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             response = await _handle_send_last(text, update)
         elif intent == "edit_last":
             response = await _handle_edit_last(text, update)
+        elif intent == "calendar":
+            response = await _handle_calendar(text)
         elif intent == "summarise":
             response = await _handle_summarise(text)
         elif intent == "draft":
@@ -258,6 +261,7 @@ def _classify_intent(text: str) -> str:
     compose_keywords = ["email", "draft", "write", "forward", "compose"]
     memory_keywords = ["remember", "update", "note that", "save that", "forget"]
     followup_keywords = ["follow up", "followup", "follow-up", "remind me", "ping me", "check back", "nudge"]
+    calendar_keywords = ["schedule", "calendar", "what's on my calendar", "my day", "meetings today", "book a meeting", "set up a call", "create event", "block time", "what do i have"]
 
     # Edit-last-draft detection
     edit_phrases = ["make it shorter", "make it longer", "more casual", "more formal",
@@ -270,6 +274,8 @@ def _classify_intent(text: str) -> str:
 
     if any(k in text_lower for k in summarise_keywords):
         return "summarise"
+    if any(k in text_lower for k in calendar_keywords):
+        return "calendar"
     if any(k in text_lower for k in followup_keywords):
         return "followup"
     if any(k in text_lower for k in reply_keywords):
@@ -281,6 +287,140 @@ def _classify_intent(text: str) -> str:
     if any(k in text_lower for k in memory_keywords):
         return "memory"
     return "query"
+
+
+async def _handle_calendar(text: str) -> str:
+    """Handle calendar queries — show today's events, upcoming, or create new events."""
+    text_lower = text.lower()
+
+    # Check if this is a "create event" request
+    create_keywords = ["book", "set up", "create", "block", "schedule a", "add to calendar"]
+    is_create = any(k in text_lower for k in create_keywords)
+
+    if is_create:
+        return await _handle_create_event(text)
+
+    # Otherwise, show calendar
+    from app.calendar.client import get_todays_events, get_upcoming_events, format_events_for_context
+
+    try:
+        if "tomorrow" in text_lower:
+            from datetime import timedelta
+            from zoneinfo import ZoneInfo
+            from app.config import get_settings
+            from app.calendar.client import list_events
+            settings = get_settings()
+            tz = ZoneInfo(settings.timezone)
+            tomorrow = datetime.now(tz) + timedelta(days=1)
+            start = tomorrow.replace(hour=0, minute=0, second=0)
+            end = tomorrow.replace(hour=23, minute=59, second=59)
+            events = await list_events(start, end)
+            day_label = "Tomorrow"
+        elif "week" in text_lower:
+            from datetime import timedelta
+            from zoneinfo import ZoneInfo
+            from app.config import get_settings
+            from app.calendar.client import list_events
+            settings = get_settings()
+            tz = ZoneInfo(settings.timezone)
+            now = datetime.now(tz)
+            end = now + timedelta(days=7)
+            events = await list_events(now, end)
+            day_label = "This week"
+        else:
+            events = await get_todays_events()
+            day_label = "Today"
+
+        if not events:
+            return f"📅 *{day_label}:* Nothing on the calendar. Your day is clear."
+
+        formatted = format_events_for_context(events)
+
+        # Get conversation history for context
+        history = _load_conversation_history(limit=5)
+        history_context = _format_history_for_context(history)
+
+        prompt = (
+            f"Garret asked about his calendar. Here's what's on it:\n\n"
+            f"=== {day_label.upper()}'S CALENDAR ===\n{formatted}\n\n"
+            f"{history_context}\n\n"
+            "Give a brief, useful summary of the day. Cross-reference with any "
+            "contacts or deals you know about. Mention any prep needed for meetings "
+            "with external parties. Keep it under 500 chars. Be direct."
+        )
+
+        return await ask_claude(prompt, max_tokens=500)
+
+    except Exception as e:
+        logger.error("Calendar handler failed", error=str(e))
+        return f"⚠️ Couldn't load calendar: `{str(e)[:200]}`"
+
+
+async def _handle_create_event(text: str) -> str:
+    """Parse a natural language event request and create a calendar event."""
+    from app.calendar.client import create_event
+    from zoneinfo import ZoneInfo
+    from app.config import get_settings
+
+    settings = get_settings()
+
+    extraction_prompt = (
+        f"The user wants to create a calendar event: '{text}'\n\n"
+        f"Today is {datetime.now(timezone.utc).strftime('%A, %B %d, %Y')}.\n"
+        f"User's timezone: {settings.timezone}\n\n"
+        "Extract as JSON with these fields:\n"
+        '- "summary": event title (short)\n'
+        '- "date": date in YYYY-MM-DD format\n'
+        '- "start_hour": start hour (24h format, integer)\n'
+        '- "start_minute": start minute (integer, default 0)\n'
+        '- "duration_minutes": duration in minutes (default 60)\n'
+        '- "attendees": list of email addresses (or empty list)\n'
+        '- "location": location string (or empty string)\n'
+        '- "description": brief description (or empty string)\n\n'
+        "If the user says 'tomorrow', compute the actual date. "
+        "If they say 'this Friday', compute it. "
+        "If no time is specified, default to 10:00 AM.\n"
+        "Return ONLY valid JSON, no markdown fences."
+    )
+
+    raw = await ask_claude(extraction_prompt, max_tokens=300)
+
+    try:
+        data = json.loads(raw.strip().removeprefix("```json").removesuffix("```").strip())
+    except (json.JSONDecodeError, ValueError):
+        return "I couldn't parse the event details. Try: 'Schedule a call with Doug tomorrow at 2pm'"
+
+    try:
+        tz = ZoneInfo(settings.timezone)
+        date_parts = data["date"].split("-")
+        start_time = datetime(
+            int(date_parts[0]), int(date_parts[1]), int(date_parts[2]),
+            data.get("start_hour", 10), data.get("start_minute", 0),
+            tzinfo=tz,
+        )
+        end_time = start_time + timedelta(minutes=data.get("duration_minutes", 60))
+
+        result = await create_event(
+            summary=data.get("summary", "Meeting"),
+            start_time=start_time,
+            end_time=end_time,
+            description=data.get("description", ""),
+            attendees=data.get("attendees", []) or None,
+            location=data.get("location", ""),
+        )
+
+        time_display = start_time.strftime("%-I:%M%p").lower()
+        date_display = start_time.strftime("%A, %b %d")
+
+        return (
+            f"📅 *Created:* {data.get('summary', 'Meeting')}\n"
+            f"*When:* {date_display} at {time_display}\n"
+            f"{'*With:* ' + ', '.join(data.get('attendees', [])) if data.get('attendees') else ''}"
+        )
+
+    except Exception as e:
+        logger.error("Event creation failed", error=str(e))
+        return f"⚠️ Couldn't create event: `{str(e)[:200]}`"
 
 
 async def _handle_summarise(text: str) -> str:
