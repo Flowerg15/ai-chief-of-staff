@@ -76,7 +76,12 @@ async def draft_reply(instruction: str) -> dict | None:
         f"The user wants to: {instruction}\n\n"
         "Draft a reply to the latest email in this thread. "
         "Return ONLY the email body — no subject line, no greeting prefix, no explanation. "
-        "Match the tone examples exactly."
+        "Match the tone examples exactly.\n\n"
+        "CRITICAL STYLE RULES:\n"
+        "- Write in natural flowing sentences and short paragraphs. NEVER use bullet points, "
+        "dashes, numbered lists, or any structured formatting. Real people don't email in bullet points.\n"
+        "- Don't sign off with 'Best,' or 'Regards,' or 'Warm regards,' — just end naturally or with 'Thanks'.\n"
+        "- Sound warm, human, and efficient — like a busy founder who's genuinely friendly."
     )
 
     body = await ask_claude_complex(prompt, context=context, max_tokens=800)

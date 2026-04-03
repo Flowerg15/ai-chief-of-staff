@@ -286,7 +286,10 @@ async def _pre_draft_stale_replies(stale_threads: list[dict]) -> list[dict]:
                 "Draft a reply. Be concise — this is a catch-up response, not an essay. "
                 "If the thread is just informational, a quick acknowledgment is fine. "
                 "Return ONLY the email body — no subject line, no greeting prefix, no explanation. "
-                "Match the tone examples exactly."
+                "Match the tone examples exactly.\n\n"
+                "CRITICAL: Write in natural sentences and short paragraphs. NEVER use bullet points, "
+                "dashes, numbered lists, or structured formatting. Don't sign off with 'Best,' or "
+                "'Regards,' — just end naturally. Sound warm, human, and efficient."
             )
 
             body = await ask_claude_complex(prompt, context=context, max_tokens=500)

@@ -326,7 +326,10 @@ async def _handle_compose(text: str, update: Update) -> str:
         "subject line here\n"
         "---SUBJECT---\n"
         "email body here\n\n"
-        "Match Garret's tone. Keep it concise. No AI-sounding phrases."
+        "Match Garret's tone. Keep it concise. No AI-sounding phrases.\n"
+        "CRITICAL: Write in natural sentences and short paragraphs. NEVER use bullet points, "
+        "dashes, numbered lists, or any structured formatting. Real people don't email in bullet points. "
+        "Don't sign off with 'Best,' or 'Regards,' — just end naturally or with 'Thanks'."
     )
 
     raw = await ask_claude_complex(prompt, max_tokens=800)
