@@ -261,7 +261,13 @@ def _classify_intent(text: str) -> str:
     compose_keywords = ["email", "draft", "write", "forward", "compose"]
     memory_keywords = ["remember", "update", "note that", "save that", "forget"]
     followup_keywords = ["follow up", "followup", "follow-up", "remind me", "ping me", "check back", "nudge"]
-    calendar_keywords = ["schedule", "calendar", "what's on my calendar", "my day", "meetings today", "book a meeting", "set up a call", "create event", "block time", "what do i have"]
+    calendar_keywords = [
+        "schedule", "calendar", "what's on my calendar", "my day", "meetings today",
+        "book a meeting", "set up a call", "create event", "block time", "what do i have",
+        "call invite", "meeting invite", "invite to", "call with", "meeting with",
+        "set up a meeting", "book a call", "schedule a call", "schedule a meeting",
+        "create a call", "create a meeting", "send a call", "send an invite",
+    ]
 
     # Edit-last-draft detection
     edit_phrases = ["make it shorter", "make it longer", "more casual", "more formal",
@@ -294,7 +300,11 @@ async def _handle_calendar(text: str) -> str:
     text_lower = text.lower()
 
     # Check if this is a "create event" request
-    create_keywords = ["book", "set up", "create", "block", "schedule a", "add to calendar"]
+    create_keywords = [
+        "book", "set up", "create", "block", "schedule a", "add to calendar",
+        "call invite", "meeting invite", "invite", "call with", "meeting with",
+        "schedule a call", "schedule a meeting", "send a call", "send an invite",
+    ]
     is_create = any(k in text_lower for k in create_keywords)
 
     if is_create:
