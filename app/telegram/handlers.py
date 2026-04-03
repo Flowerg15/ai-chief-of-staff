@@ -374,9 +374,13 @@ async def _handle_create_event(text: str) -> str:
 
     settings = get_settings()
 
+    tz = ZoneInfo(settings.timezone)
+    local_now = datetime.now(tz)
+
     extraction_prompt = (
         f"The user wants to create a calendar event: '{text}'\n\n"
-        f"Today is {datetime.now(timezone.utc).strftime('%A, %B %d, %Y')}.\n"
+        f"Today is {local_now.strftime('%A, %B %d, %Y')}. "
+        f"Current local time is {local_now.strftime('%-I:%M %p')}.\n"
         f"User's timezone: {settings.timezone}\n\n"
         "Extract as JSON with these fields:\n"
         '- "summary": event title (short)\n'
