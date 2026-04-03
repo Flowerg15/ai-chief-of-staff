@@ -156,8 +156,14 @@ async def create_event(
         event_body["description"] = description
     if location:
         event_body["location"] = location
-    if attendees:
-        event_body["attendees"] = [{"email": a} for a in attendees]
+    # Always include the owner as an attendee so they get the invite
+    settings = get_settings()
+    owner_email = settings.gmail_user_email
+    all_attendees = list(attendees) if attendees else []
+    if owner_email and owner_email not in all_attendees:
+        all_attendees.append(owner_email)
+    if all_attendees:
+        event_body["attendees"] = [{"email": a} for a in all_attendees]
 
     # Auto-attach Google Meet link
     if add_meet:
@@ -172,7 +178,7 @@ async def create_event(
     result = service.events().insert(
         calendarId="primary",
         body=event_body,
-        sendUpdates="all" if attendees else "none",
+        sendUpdates="all",
         conferenceDataVersion=1 if add_meet else 0,
     ).execute()
 
