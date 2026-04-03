@@ -84,6 +84,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             response = await _handle_summarise(text)
         elif intent == "draft":
             response = await _handle_draft(text, update)
+        elif intent == "compose":
+            response = await _handle_compose(text, update)
         elif intent == "followup":
             response = await _handle_followup(text)
         elif intent == "query":
@@ -142,16 +144,23 @@ def _classify_intent(text: str) -> str:
     text_lower = text.lower()
 
     summarise_keywords = ["summarise", "summarize", "inbox", "what's new", "what's in", "check email", "brief", "what came in"]
-    draft_keywords = ["reply", "draft", "write", "respond", "send", "forward"]
+    reply_keywords = ["reply", "respond", "reply to"]
+    compose_keywords = ["email", "send", "draft", "write", "forward", "compose", "message"]
     memory_keywords = ["remember", "update", "note that", "save that", "forget"]
     followup_keywords = ["follow up", "followup", "follow-up", "remind me", "ping me", "check back", "nudge"]
 
     if any(k in text_lower for k in summarise_keywords):
         return "summarise"
-    if any(k in text_lower for k in draft_keywords):
-        return "draft"
     if any(k in text_lower for k in followup_keywords):
         return "followup"
+    # "reply to X" = reply to existing thread; "email X about Y" = compose new
+    if any(k in text_lower for k in reply_keywords):
+        return "draft"
+    if any(k in text_lower for k in compose_keywords):
+        # If there's an @ sign, it's likely a compose (new email to someone)
+        if "@" in text_lower:
+            return "compose"
+        return "draft"
     if any(k in text_lower for k in memory_keywords):
         return "memory"
     return "query"
@@ -256,6 +265,112 @@ async def _handle_memory_update(text: str) -> str:
     return f"✅ *Saved:* {summary}"
 
 
+async def _handle_compose(text: str, update: Update) -> str:
+    """
+    Compose and send a brand-new email (not a reply to an existing thread).
+    Extracts recipient, subject, and generates body via Claude.
+    """
+    import uuid
+    import re
+
+    # Extract email address from the message
+    email_match = re.search(r'[\w.+-]+@[\w-]+\.[\w.-]+', text)
+    if not email_match:
+        return "I couldn't find an email address in your message. Try: 'Email john@example.com about ...'"
+
+    to_email = email_match.group(0)
+
+    # Look up contact for context
+    client = get_supabase()
+    contact_result = client.table("contacts").select("*").eq("email", to_email.lower()).maybe_single().execute()
+    contact = contact_result.data if contact_result and contact_result.data else None
+    to_name = contact["name"] if contact else to_email.split("@")[0].title()
+
+    # Load tone samples
+    category = "formal_external"
+    if contact and contact.get("importance", 3) < 4:
+        category = "quick_internal"
+    tone_result = (
+        client.table("tone_samples")
+        .select("*")
+        .eq("category", category)
+        .eq("is_active", True)
+        .limit(3)
+        .execute()
+    )
+    tone_samples = tone_result.data or []
+
+    tone_context = ""
+    if tone_samples:
+        tone_context = "\n\nTONE EXAMPLES (match this voice):\n"
+        for i, sample in enumerate(tone_samples[:3], 1):
+            tone_context += f"\n--- Example {i} ---\n{sample['body'][:400]}\n"
+
+    contact_context = ""
+    if contact:
+        contact_context = f"\nContact: {contact['name']}"
+        if contact.get("company"):
+            contact_context += f" at {contact['company']}"
+        if contact.get("notes"):
+            contact_context += f"\nNotes: {contact['notes']}"
+
+    prompt = (
+        f"Garret wants to send a NEW email (not a reply).\n"
+        f"Instruction: {text}\n"
+        f"Recipient: {to_name} <{to_email}>\n"
+        f"{contact_context}\n{tone_context}\n\n"
+        "Generate TWO things, separated by the exact marker '---SUBJECT---':\n"
+        "1. A short email subject line\n"
+        "2. The email body\n\n"
+        "Format:\n"
+        "subject line here\n"
+        "---SUBJECT---\n"
+        "email body here\n\n"
+        "Match Garret's tone. Keep it concise. No AI-sounding phrases."
+    )
+
+    raw = await ask_claude_complex(prompt, max_tokens=800)
+
+    # Parse subject and body
+    if "---SUBJECT---" in raw:
+        parts = raw.split("---SUBJECT---", 1)
+        subject = parts[0].strip()
+        body = parts[1].strip()
+    else:
+        # Fallback: first line is subject
+        lines = raw.strip().split("\n", 1)
+        subject = lines[0].strip()
+        body = lines[1].strip() if len(lines) > 1 else raw.strip()
+
+    # Clean up subject (remove "Subject:" prefix if Claude added it)
+    subject = subject.removeprefix("Subject:").strip()
+
+    draft_id = str(uuid.uuid4())[:8]
+    draft = {
+        "body": body,
+        "to": to_email,
+        "to_name": to_name,
+        "subject": subject,
+        "thread_id": None,  # New email, no thread
+        "in_reply_to": None,
+        "is_new": True,
+    }
+    _store_draft(draft_id, draft)
+
+    preview = (
+        f"*New email to {to_name}:*\n\n"
+        f"Subject: _{subject}_\n\n"
+        f"`{body}`"
+    )
+
+    await update.message.reply_text(
+        preview,
+        parse_mode="Markdown",
+        reply_markup=send_confirmation_keyboard(draft_id),
+    )
+    return ""  # Already sent via reply_text
+
+
 async def _handle_followup(text: str) -> str:
     """
     Parse a follow-up instruction like "Follow up with Doug in 3 days"
@@ -309,24 +424,33 @@ async def _handle_followup(text: str) -> str:
 
 
 async def _execute_send(draft_id: str, query) -> None:
-    """Send the approved draft email."""
+    """Send the approved draft email — works for both replies and new emails."""
     draft = _load_draft(draft_id)
     if not draft:
         await query.edit_message_text("_Draft expired or already sent._", parse_mode="Markdown")
         return
 
     try:
-        from app.gmail.client import send_reply
-        from app.database.client import get_supabase
         from datetime import datetime, timezone
 
-        message_id = await send_reply(
-            thread_id=draft["thread_id"],
-            message_id=draft["in_reply_to"],
-            to=draft["to"],
-            subject=draft["subject"],
-            body=draft["body"],
-        )
+        if draft.get("is_new") or not draft.get("thread_id"):
+            # New email (compose)
+            from app.gmail.client import send_new_email
+            message_id = await send_new_email(
+                to=draft["to"],
+                subject=draft["subject"],
+                body=draft["body"],
+            )
+        else:
+            # Reply to existing thread
+            from app.gmail.client import send_reply
+            message_id = await send_reply(
+                thread_id=draft["thread_id"],
+                message_id=draft["in_reply_to"],
+                to=draft["to"],
+                subject=draft["subject"],
+                body=draft["body"],
+            )
 
         # Audit log
         client = get_supabase()

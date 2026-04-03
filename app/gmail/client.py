@@ -187,6 +187,29 @@ Content-Type: text/plain; charset=utf-8
     return result["id"]
 
 
+async def send_new_email(to: str, subject: str, body: str) -> str:
+    """
+    Send a brand-new email (not a reply).
+    Returns the new message ID.
+    """
+    service = await _get_service()
+
+    raw_message = f"""To: {to}
+Subject: {subject}
+Content-Type: text/plain; charset=utf-8
+
+{body}"""
+
+    encoded = base64.urlsafe_b64encode(raw_message.encode("utf-8")).decode("utf-8")
+    result = service.users().messages().send(
+        userId="me",
+        body={"raw": encoded},
+    ).execute()
+
+    logger.info("New email sent", message_id=result["id"], to=to, subject=subject)
+    return result["id"]
+
+
 async def download_attachment(message_id: str, attachment_id: str) -> bytes:
     """Download an email attachment and return its raw bytes."""
     service = await _get_service()
