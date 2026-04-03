@@ -132,9 +132,10 @@ async def create_event(
     description: str = "",
     attendees: list[str] | None = None,
     location: str = "",
+    add_meet: bool = True,
 ) -> dict:
     """
-    Create a new calendar event.
+    Create a new calendar event with an auto-attached Google Meet link.
     Returns the created event dict.
     """
     service = await _get_service()
@@ -158,13 +159,30 @@ async def create_event(
     if attendees:
         event_body["attendees"] = [{"email": a} for a in attendees]
 
+    # Auto-attach Google Meet link
+    if add_meet:
+        import uuid
+        event_body["conferenceData"] = {
+            "createRequest": {
+                "requestId": str(uuid.uuid4()),
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        }
+
     result = service.events().insert(
         calendarId="primary",
         body=event_body,
         sendUpdates="all" if attendees else "none",
+        conferenceDataVersion=1 if add_meet else 0,
     ).execute()
 
-    logger.info("Calendar event created", event_id=result["id"], summary=summary)
+    meet_link = result.get("hangoutLink", "")
+    logger.info(
+        "Calendar event created",
+        event_id=result["id"],
+        summary=summary,
+        meet_link=meet_link,
+    )
     return result
 
 

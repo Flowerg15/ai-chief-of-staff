@@ -412,10 +412,15 @@ async def _handle_create_event(text: str) -> str:
         time_display = start_time.strftime("%-I:%M%p").lower()
         date_display = start_time.strftime("%A, %b %d")
 
+        meet_link = result.get("hangoutLink", "")
+        meet_line = f"\n*Meet:* {meet_link}" if meet_link else ""
+        attendees_line = f"\n*With:* {', '.join(data.get('attendees', []))}" if data.get('attendees') else ""
+
         return (
             f"📅 *Created:* {data.get('summary', 'Meeting')}\n"
-            f"*When:* {date_display} at {time_display}\n"
-            f"{'*With:* ' + ', '.join(data.get('attendees', [])) if data.get('attendees') else ''}"
+            f"*When:* {date_display} at {time_display}"
+            f"{attendees_line}"
+            f"{meet_line}"
         )
 
     except Exception as e:
