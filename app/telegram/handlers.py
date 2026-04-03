@@ -3,6 +3,7 @@ Telegram message handlers.
 Routes incoming messages to the appropriate workflow.
 """
 import asyncio
+import json
 import structlog
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -15,9 +16,35 @@ from app.telegram.keyboards import send_confirmation_keyboard
 
 logger = structlog.get_logger(__name__)
 
-# In-memory draft store (keyed by draft_id)
-# In V2, persist these in Supabase
-_pending_drafts: dict[str, dict] = {}
+
+# ─── Draft persistence (Supabase-backed) ────────────────────────────────────
+
+def _store_draft(draft_id: str, draft: dict) -> None:
+    """Persist a pending draft to Supabase system_state."""
+    client = get_supabase()
+    client.table("system_state").upsert({
+        "key": f"draft:{draft_id}",
+        "value": draft,
+    }).execute()
+
+
+def _load_draft(draft_id: str) -> dict | None:
+    """Load a pending draft from Supabase. Returns None if expired/missing."""
+    client = get_supabase()
+    result = client.table("system_state").select("value").eq("key", f"draft:{draft_id}").maybe_single().execute()
+    if result.data:
+        _delete_draft(draft_id)
+        return result.data["value"]
+    return None
+
+
+def _delete_draft(draft_id: str) -> None:
+    """Remove a draft from Supabase."""
+    try:
+        client = get_supabase()
+        client.table("system_state").delete().eq("key", f"draft:{draft_id}").execute()
+    except Exception:
+        pass
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -64,10 +91,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             response = await ask_claude(text)
 
-        if response:
-            await processing_msg.edit_text(response, parse_mode="Markdown")
-        else:
-            await processing_msg.delete()
+        await processing_msg.edit_text(response, parse_mode="Markdown")
 
     except Exception as e:
         logger.error("Handler error", error=str(e), intent=text[:60])
@@ -91,16 +115,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data.startswith("edit:"):
         draft_id = data.split(":", 1)[1]
-        draft = _pending_drafts.get(draft_id)
+        draft = _load_draft(draft_id)
         if draft:
+            # Re-store so user can still send after editing
+            _store_draft(draft_id, draft)
             await query.edit_message_text(
                 f"*Edit the draft and send it back to me:*\n\n`{draft['body']}`",
                 parse_mode="Markdown",
             )
+        else:
+            await query.edit_message_text("_Draft expired._", parse_mode="Markdown")
 
     elif data.startswith("skip:"):
         draft_id = data.split(":", 1)[1]
-        _pending_drafts.pop(draft_id, None)
+        _delete_draft(draft_id)
         await query.edit_message_text("_Skipped._", parse_mode="Markdown")
 
 
@@ -149,7 +177,7 @@ async def _handle_draft(text: str, update: Update) -> str:
         return "Couldn't find the thread to draft a reply for. Can you be more specific?"
 
     draft_id = str(uuid.uuid4())[:8]
-    _pending_drafts[draft_id] = result
+    _store_draft(draft_id, result)
 
     preview = (
         f"*Draft reply to {result.get('to_name', result['to'])}:*\n\n"
@@ -167,54 +195,65 @@ async def _handle_draft(text: str, update: Update) -> str:
 
 
 async def _handle_memory_update(text: str) -> str:
-    """Parse a memory update instruction and apply it to the database."""
-    import json
+    """
+    Parse a memory update instruction, extract structured data via Claude,
+    and persist it to Supabase.
+    """
+    from datetime import datetime, timezone
 
-    prompt = (
-        f"The user wants to update memory: '{text}'\n\n"
-        "Extract the update as JSON with keys: table (contacts|deals|notes), "
-        "identifier (name or email to match), and fields (dict of columns to set).\n"
-        "Also include a confirmation message in a 'message' key.\n"
-        "Return ONLY valid JSON, no markdown."
+    extraction_prompt = (
+        f"The user wants to update their memory/CRM: '{text}'\n\n"
+        "Extract the update as JSON with these fields:\n"
+        '- "type": one of "contact", "deal", or "note"\n'
+        '- "name": the person or deal name\n'
+        '- "updates": a dict of fields to update (e.g., {{"title": "VP of Sales", "company": "Acme"}})\n'
+        '- "summary": a one-line human-readable summary of what was saved\n\n'
+        "Return ONLY valid JSON, no markdown fences."
     )
-    raw = await ask_claude(prompt)
+
+    raw = await ask_claude(extraction_prompt, max_tokens=300)
 
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return await ask_claude(
-            f"The user wants to update memory: '{text}'\n\n"
-            "Identify what needs to be updated (contact, deal, or note) and confirm what you're saving."
-        )
-
-    table = parsed.get("table", "contacts")
-    identifier = parsed.get("identifier", "")
-    fields = parsed.get("fields", {})
-    confirmation = parsed.get("message", "Memory updated.")
-
-    if not identifier or not fields:
-        return confirmation
+        import json
+        data = json.loads(raw.strip().removeprefix("```json").removesuffix("```").strip())
+    except (json.JSONDecodeError, ValueError):
+        return f"I understood your request but couldn't parse it into a structured update. Here's what I got:\n\n{raw}"
 
     client = get_supabase()
-    if table == "contacts":
-        client.table("contacts").update(fields).eq("email", identifier).execute()
-    elif table == "deals":
-        client.table("deals").update(fields).eq("name", identifier).execute()
-    elif table == "notes":
-        from datetime import datetime, timezone
-        client.table("decisions").insert({
-            "context": identifier,
-            "decision": json.dumps(fields),
-            "rationale": text,
-            "date": datetime.now(timezone.utc).isoformat(),
+    record_type = data.get("type", "note")
+    name = data.get("name", "")
+    updates = data.get("updates", {})
+    summary = data.get("summary", "Update saved.")
+
+    if record_type == "contact" and name:
+        # Upsert contact
+        existing = client.table("contacts").select("*").ilike("name", name).maybe_single().execute()
+        if existing.data:
+            client.table("contacts").update(updates).eq("id", existing.data["id"]).execute()
+        else:
+            client.table("contacts").insert({"name": name, **updates}).execute()
+
+    elif record_type == "deal" and name:
+        existing = client.table("deals").select("*").ilike("name", name).maybe_single().execute()
+        if existing.data:
+            client.table("deals").update(updates).eq("id", existing.data["id"]).execute()
+        else:
+            client.table("deals").insert({"name": name, **updates}).execute()
+
+    else:
+        # Store as a note in system_state
+        note_key = f"note:{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        client.table("system_state").upsert({
+            "key": note_key,
+            "value": {"text": text, "parsed": data},
         }).execute()
 
-    return f"✅ {confirmation}"
+    return f"✅ *Saved:* {summary}"
 
 
 async def _execute_send(draft_id: str, query) -> None:
     """Send the approved draft email."""
-    draft = _pending_drafts.pop(draft_id, None)
+    draft = _load_draft(draft_id)
     if not draft:
         await query.edit_message_text("_Draft expired or already sent._", parse_mode="Markdown")
         return

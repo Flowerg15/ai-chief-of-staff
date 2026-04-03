@@ -2,8 +2,9 @@
 APScheduler setup.
 Fires the daily brief at configured times.
 """
+import asyncio
 import structlog
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.config import get_settings
@@ -11,7 +12,7 @@ from app.config import get_settings
 logger = structlog.get_logger(__name__)
 settings = get_settings()
 
-_scheduler: AsyncIOScheduler | None = None
+_scheduler: BackgroundScheduler | None = None
 
 
 def _parse_time(time_str: str) -> tuple[int, int]:
@@ -20,24 +21,37 @@ def _parse_time(time_str: str) -> tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
-async def _run_brief():
-    """Run the async brief directly on the event loop."""
+def _run_brief():
+    """
+    Sync wrapper to run the async brief from the scheduler thread.
+    Submits to the running FastAPI event loop instead of creating a new one.
+    Falls back to asyncio.run() if no loop is running.
+    """
     from app.workflows.brief import generate_and_send_brief
     from app.telegram.bot import send_message
 
-    try:
-        await generate_and_send_brief()
-    except Exception as e:
-        logger.error("Scheduled brief failed", error=str(e))
+    async def _run():
         try:
-            await send_message(f"⚠️ *SYSTEM ALERT*: Daily brief failed.\n`{str(e)[:300]}`")
-        except Exception:
-            pass  # Don't let the alert itself crash the scheduler
+            await generate_and_send_brief()
+        except Exception as e:
+            logger.error("Scheduled brief failed", error=str(e))
+            try:
+                await send_message(f"⚠️ *SYSTEM ALERT*: Daily brief failed.\n`{str(e)[:300]}`")
+            except Exception:
+                pass
+
+    try:
+        loop = asyncio.get_running_loop()
+        # Submit to the existing event loop (FastAPI's)
+        asyncio.run_coroutine_threadsafe(_run(), loop).result(timeout=120)
+    except RuntimeError:
+        # No running loop (shouldn't happen in production, but safe fallback)
+        asyncio.run(_run())
 
 
 def start_scheduler() -> None:
     global _scheduler
-    _scheduler = AsyncIOScheduler(timezone=settings.timezone)
+    _scheduler = BackgroundScheduler(timezone=settings.timezone)
 
     morning_hour, morning_min = _parse_time(settings.brief_time_morning)
     afternoon_hour, afternoon_min = _parse_time(settings.brief_time_afternoon)

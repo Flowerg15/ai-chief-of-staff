@@ -8,11 +8,15 @@ import structlog
 from datetime import datetime, timezone, timedelta
 from typing import Any
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from app.gmail.auth import get_credentials
 from app.database.models import EmailMessage
 
 logger = structlog.get_logger(__name__)
+
+# Timeout for individual Gmail API calls (seconds)
+GMAIL_TIMEOUT = 30
 
 
 async def _get_service():
@@ -70,11 +74,22 @@ async def list_recent_emails(hours: int = 48) -> list[EmailMessage]:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     query = f"after:{int(cutoff.timestamp())}"
 
-    results = service.users().messages().list(
-        userId="me",
-        q=query,
-        maxResults=50,
-    ).execute()
+    try:
+        results = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=50,
+        ).execute()
+    except HttpError as e:
+        if e.resp.status == 401:
+            logger.error("Gmail auth expired or revoked", status=e.resp.status)
+            raise RuntimeError("Gmail authorisation expired. Please re-authorise via /gmail/oauth/callback.")
+        elif e.resp.status == 429:
+            logger.warning("Gmail rate limited", status=e.resp.status)
+            raise RuntimeError("Gmail rate limit hit. Try again in a minute.")
+        else:
+            logger.error("Gmail API error", status=e.resp.status, error=str(e))
+            raise RuntimeError(f"Gmail API error ({e.resp.status}): {str(e)[:200]}")
 
     messages_meta = results.get("messages", [])
     emails: list[EmailMessage] = []

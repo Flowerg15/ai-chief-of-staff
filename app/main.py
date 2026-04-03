@@ -101,7 +101,12 @@ async def telegram_webhook(request: Request):
 @app.get("/gmail/oauth/callback")
 async def gmail_oauth_callback(code: str, state: str | None = None):
     """Handle Gmail OAuth redirect after user authorises."""
-    from app.gmail.auth import exchange_code_for_tokens
+    from app.gmail.auth import exchange_code_for_tokens, verify_oauth_state
+
+    if not verify_oauth_state(state):
+        logger.warning("OAuth state mismatch — possible CSRF", state=state)
+        raise HTTPException(status_code=403, detail="Invalid OAuth state. Please retry the auth flow.")
+
     try:
         await exchange_code_for_tokens(code)
         return JSONResponse({"status": "Gmail authorised. You can close this window."})

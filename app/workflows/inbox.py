@@ -102,8 +102,12 @@ async def retrieve_context_for_query(query: str) -> str:
 
 
 async def _cache_emails(emails: list[EmailMessage]) -> None:
-    """Store emails in Supabase, skipping duplicates."""
+    """Store emails in Supabase, skipping duplicates. Also tracks waiting_on_garret."""
+    from app.config import get_settings
+    settings = get_settings()
+    my_email = settings.gmail_user_email.lower()
     client = get_supabase()
+
     for email in emails:
         try:
             client.table("email_cache").upsert(
@@ -121,6 +125,42 @@ async def _cache_emails(emails: list[EmailMessage]) -> None:
             ).execute()
         except Exception as e:
             logger.warning("Failed to cache email", message_id=email.gmail_message_id, error=str(e))
+
+    # Update waiting_on_garret for threads with inbound emails
+    _update_waiting_status(emails, my_email, client)
+
+
+def _update_waiting_status(emails: list[EmailMessage], my_email: str, client) -> None:
+    """
+    Mark threads as waiting_on_garret if the latest message is FROM someone else.
+    Clear the flag if the latest message is FROM Garret.
+    """
+    from datetime import datetime, timezone
+
+    # Group by thread, keep only the latest email per thread
+    thread_latest: dict[str, EmailMessage] = {}
+    for email in emails:
+        tid = email.gmail_thread_id
+        if tid not in thread_latest or (email.received_at and thread_latest[tid].received_at and email.received_at > thread_latest[tid].received_at):
+            thread_latest[tid] = email
+
+    for tid, latest in thread_latest.items():
+        sender = (latest.sender or "").lower()
+        # Extract email from "Name <email>" format
+        if "<" in sender:
+            sender = sender.split("<")[1].rstrip(">").strip()
+
+        is_from_me = my_email in sender
+        try:
+            # Check if thread exists in DB
+            existing = client.table("threads").select("id").eq("gmail_thread_id", tid).maybe_single().execute()
+            if existing.data:
+                client.table("threads").update({
+                    "waiting_on_garret": not is_from_me,
+                    "waiting_since": datetime.now(timezone.utc).isoformat() if not is_from_me else None,
+                }).eq("id", existing.data["id"]).execute()
+        except Exception as e:
+            logger.debug("Could not update thread waiting status", thread_id=tid, error=str(e))
 
 
 async def _load_contacts_by_email(email_addresses: list[str]) -> list[dict]:

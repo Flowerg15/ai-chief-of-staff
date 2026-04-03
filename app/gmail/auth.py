@@ -9,6 +9,7 @@ Flow:
 5. The Gmail client uses the stored refresh token for all subsequent calls
 """
 import json
+import secrets
 import structlog
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -19,6 +20,9 @@ from app.database.client import store_system_value, get_system_value
 
 logger = structlog.get_logger(__name__)
 settings = get_settings()
+
+# CSRF state token for OAuth flow
+_oauth_state: str | None = None
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -48,13 +52,27 @@ def _build_flow() -> Flow:
 
 def get_auth_url() -> str:
     """Generate the Google OAuth URL for initial authorisation."""
+    global _oauth_state
     flow = _build_flow()
+    _oauth_state = secrets.token_urlsafe(32)
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        prompt="consent",  # Force consent to get refresh_token
+        prompt="consent",
+        state=_oauth_state,
     )
     return auth_url
+
+
+def verify_oauth_state(state: str | None) -> bool:
+    """Verify the CSRF state token matches."""
+    global _oauth_state
+    if _oauth_state is None:
+        # First-time setup or manual URL — allow it
+        return True
+    valid = state == _oauth_state
+    _oauth_state = None  # One-time use
+    return valid
 
 
 async def exchange_code_for_tokens(code: str) -> None:

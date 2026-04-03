@@ -137,9 +137,11 @@ async def _get_stale_thread_count() -> int:
 
 def _is_evening_brief() -> bool:
     """True if this is the afternoon/evening brief."""
+    from zoneinfo import ZoneInfo
     from app.config import get_settings
     settings = get_settings()
-    now_hour = datetime.now().hour
+    tz = ZoneInfo(settings.timezone)
+    now_hour = datetime.now(tz).hour
     brief_hour = int(settings.brief_time_afternoon.split(":")[0])
     return abs(now_hour - brief_hour) <= 1
 
