@@ -84,6 +84,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             response = await _handle_summarise(text)
         elif intent == "draft":
             response = await _handle_draft(text, update)
+        elif intent == "followup":
+            response = await _handle_followup(text)
         elif intent == "query":
             response = await _handle_query(text)
         elif intent == "memory":
@@ -142,11 +144,14 @@ def _classify_intent(text: str) -> str:
     summarise_keywords = ["summarise", "summarize", "inbox", "what's new", "what's in", "check email", "brief", "what came in"]
     draft_keywords = ["reply", "draft", "write", "respond", "send", "forward"]
     memory_keywords = ["remember", "update", "note that", "save that", "forget"]
+    followup_keywords = ["follow up", "followup", "follow-up", "remind me", "ping me", "check back", "nudge"]
 
     if any(k in text_lower for k in summarise_keywords):
         return "summarise"
     if any(k in text_lower for k in draft_keywords):
         return "draft"
+    if any(k in text_lower for k in followup_keywords):
+        return "followup"
     if any(k in text_lower for k in memory_keywords):
         return "memory"
     return "query"
@@ -249,6 +254,58 @@ async def _handle_memory_update(text: str) -> str:
         }).execute()
 
     return f"✅ *Saved:* {summary}"
+
+
+async def _handle_followup(text: str) -> str:
+    """
+    Parse a follow-up instruction like "Follow up with Doug in 3 days"
+    and create a scheduled reminder in system_state.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    extraction_prompt = (
+        f"The user wants to schedule a follow-up: '{text}'\n\n"
+        "Extract as JSON with these fields:\n"
+        '- "contact_name": the person to follow up with (or null)\n'
+        '- "subject_hint": what the follow-up is about (short phrase)\n'
+        '- "days": number of days from now to trigger the follow-up (integer)\n'
+        '- "action": what to do when triggered — "check_reply" (see if they replied) or "nudge" (draft a nudge email)\n'
+        '- "summary": one-line human-readable confirmation\n\n'
+        "If the user says 'in a week', that's 7 days. 'Tomorrow' is 1. 'In a few days' is 3.\n"
+        "Return ONLY valid JSON, no markdown fences."
+    )
+
+    raw = await ask_claude(extraction_prompt, max_tokens=300)
+
+    try:
+        data = json.loads(raw.strip().removeprefix("```json").removesuffix("```").strip())
+    except (json.JSONDecodeError, ValueError):
+        return f"I understood the follow-up request but couldn't parse the timing. Try: 'Follow up with Doug in 3 days about the memo.'"
+
+    days = data.get("days", 3)
+    trigger_at = datetime.now(timezone.utc) + timedelta(days=days)
+
+    followup = {
+        "contact_name": data.get("contact_name"),
+        "subject_hint": data.get("subject_hint", ""),
+        "action": data.get("action", "check_reply"),
+        "trigger_at": trigger_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+    }
+
+    followup_key = f"followup:{trigger_at.strftime('%Y%m%d_%H%M%S')}"
+
+    client = get_supabase()
+    client.table("system_state").upsert({
+        "key": followup_key,
+        "value": followup,
+    }).execute()
+
+    trigger_display = trigger_at.strftime("%a, %b %d")
+    summary = data.get("summary", f"Follow up with {data.get('contact_name', 'contact')} on {trigger_display}")
+
+    return f"⏰ *Scheduled:* {summary}\n\nI'll check on *{trigger_display}* and ping you — with a draft nudge if they haven't replied."
 
 
 async def _execute_send(draft_id: str, query) -> None:

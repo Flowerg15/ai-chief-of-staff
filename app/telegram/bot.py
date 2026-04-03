@@ -72,21 +72,25 @@ async def handle_telegram_update(body: dict) -> None:
         logger.warning("Blocked update from unknown chat", chat_id=chat_id)
         return
 
-    await app.process_update(update)
+    async with app:
+        await app.process_update(update)
 
 
-async def send_message(text: str, parse_mode: str = "Markdown") -> None:
-    """Send a message to Garret's chat. Used by background jobs."""
+async def send_message(text: str, parse_mode: str = "Markdown", reply_markup=None) -> None:
+    """Send a message to Garret's chat. Used by background jobs and proactive briefs."""
     app = get_app()
     bot: Bot = app.bot
     # Split long messages (Telegram limit is 4096 chars)
     chunks = _split_message(text)
     for i, chunk in enumerate(chunks):
         suffix = f"\n\n_[Part {i+1}/{len(chunks)}]_" if len(chunks) > 1 else ""
+        # Only attach reply_markup to the last chunk
+        markup = reply_markup if (i == len(chunks) - 1) else None
         await bot.send_message(
             chat_id=settings.telegram_chat_id,
             text=chunk + suffix,
             parse_mode=parse_mode,
+            reply_markup=markup,
         )
 
 
