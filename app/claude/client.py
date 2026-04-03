@@ -39,6 +39,7 @@ async def ask_claude(
     system_override: str | None = None,
     model: str = SONNET,
     max_tokens: int = 1024,
+    conversation_history: list[dict] | None = None,
 ) -> str:
     """
     Send a message to Claude and return the text response.
@@ -49,6 +50,8 @@ async def ask_claude(
         system_override: Use a different system prompt (e.g., for brief generation).
         model: Which Claude model to use.
         max_tokens: Maximum tokens in the response.
+        conversation_history: Optional list of {"role": "user"|"assistant", "content": "..."} dicts
+                              for multi-turn conversations. If provided, used as the messages array.
     """
     client = get_client()
     system = system_override or SYSTEM_PROMPT
@@ -57,11 +60,19 @@ async def ask_claude(
 
     logger.info("Calling Claude", model=model, message_preview=user_message[:100])
 
+    # Build messages array
+    if conversation_history:
+        # Use the full conversation history, append current message at the end
+        messages = list(conversation_history)
+        messages.append({"role": "user", "content": full_message})
+    else:
+        messages = [{"role": "user", "content": full_message}]
+
     response = await client.messages.create(
         model=model,
         max_tokens=max_tokens,
         system=system,
-        messages=[{"role": "user", "content": full_message}],
+        messages=messages,
     )
 
     text = response.content[0].text

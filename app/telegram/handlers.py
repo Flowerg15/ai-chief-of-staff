@@ -1,6 +1,7 @@
 """
 Telegram message handlers.
 Routes incoming messages to the appropriate workflow.
+Maintains full conversation history in Supabase for multi-turn context.
 """
 import asyncio
 import json
@@ -26,6 +27,11 @@ def _store_draft(draft_id: str, draft: dict) -> None:
         "key": f"draft:{draft_id}",
         "value": draft,
     }).execute()
+    # Also store as "last_draft" for "send that" continuity
+    client.table("system_state").upsert({
+        "key": "last_draft_id",
+        "value": {"draft_id": draft_id},
+    }).execute()
 
 
 def _load_draft(draft_id: str) -> dict | None:
@@ -47,14 +53,89 @@ def _delete_draft(draft_id: str) -> None:
         pass
 
 
+def _get_last_draft_id() -> str | None:
+    """Get the most recently created draft ID."""
+    try:
+        client = get_supabase()
+        result = client.table("system_state").select("value").eq("key", "last_draft_id").maybe_single().execute()
+        if result.data:
+            return result.data["value"].get("draft_id")
+    except Exception:
+        pass
+    return None
+
+
+# ─── Conversation history (Supabase-backed) ─────────────────────────────────
+
+def _save_message(role: str, content: str) -> None:
+    """Save a message to conversation history."""
+    from datetime import datetime, timezone
+    try:
+        client = get_supabase()
+        ts = datetime.now(timezone.utc).isoformat()
+        key = f"chat:{ts}:{role}"
+        client.table("system_state").upsert({
+            "key": key,
+            "value": {
+                "role": role,
+                "content": content[:3000],  # Cap per-message to keep context manageable
+                "timestamp": ts,
+            },
+        }).execute()
+    except Exception as e:
+        logger.debug("Failed to save chat message", error=str(e))
+
+
+def _load_conversation_history(limit: int = 20) -> list[dict]:
+    """
+    Load recent conversation history from Supabase.
+    Returns list of {"role": "user"|"assistant", "content": "..."} dicts,
+    ordered oldest to newest.
+    """
+    try:
+        client = get_supabase()
+        result = (
+            client.table("system_state")
+            .select("value")
+            .like("key", "chat:%")
+            .order("key", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        messages = []
+        for row in reversed(result.data or []):
+            val = row.get("value", {})
+            messages.append({
+                "role": val.get("role", "user"),
+                "content": val.get("content", ""),
+            })
+        return messages
+    except Exception as e:
+        logger.debug("Failed to load chat history", error=str(e))
+        return []
+
+
+def _format_history_for_context(history: list[dict]) -> str:
+    """Format conversation history as a context block for Claude."""
+    if not history:
+        return ""
+
+    lines = ["=== CONVERSATION HISTORY ===\n"]
+    for msg in history:
+        role_label = "Garret" if msg["role"] == "user" else "Chief of Staff"
+        lines.append(f"{role_label}: {msg['content'][:500]}")
+    lines.append("\n=== END HISTORY ===\n")
+    return "\n".join(lines)
+
+
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "*AI Chief of Staff online.*\n\n"
         "Send me a message to:\n"
         "• Summarise your inbox\n"
-        "• Draft a reply\n"
+        "• Draft a reply or compose a new email\n"
         "• Ask about a contact or deal\n"
-        "• Process an attachment\n\n"
+        "• Set a follow-up reminder\n\n"
         "No commands needed — just talk.",
         parse_mode="Markdown",
     )
@@ -63,11 +144,14 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Route a message to the right workflow based on intent.
-    Sends 'Processing...' immediately; edits when ready.
+    Saves all messages to conversation history for multi-turn context.
     """
     text = update.message.text.strip()
     if not text:
         return
+
+    # Save user message to history
+    _save_message("user", text)
 
     # Acknowledge immediately
     await context.bot.send_chat_action(
@@ -80,7 +164,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         intent = _classify_intent(text)
         logger.info("Message received", intent=intent, preview=text[:80])
 
-        if intent == "summarise":
+        if intent == "send_last":
+            response = await _handle_send_last(text, update)
+        elif intent == "edit_last":
+            response = await _handle_edit_last(text, update)
+        elif intent == "summarise":
             response = await _handle_summarise(text)
         elif intent == "draft":
             response = await _handle_draft(text, update)
@@ -93,16 +181,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         elif intent == "memory":
             response = await _handle_memory_update(text)
         else:
-            response = await ask_claude(text)
+            # General chat — include conversation history for context
+            history = _load_conversation_history(limit=20)
+            history_context = _format_history_for_context(history)
+            response = await ask_claude(text, context=history_context)
 
-        await processing_msg.edit_text(response, parse_mode="Markdown")
+        # Save assistant response to history (if non-empty)
+        if response:
+            _save_message("assistant", response)
+            await processing_msg.edit_text(response, parse_mode="Markdown")
+        else:
+            # Response was sent directly (e.g., draft with keyboard)
+            try:
+                await processing_msg.delete()
+            except Exception:
+                await processing_msg.edit_text("👆", parse_mode="Markdown")
 
     except Exception as e:
         logger.error("Handler error", error=str(e), intent=text[:60])
-        await processing_msg.edit_text(
-            f"⚠️ Something went wrong: `{str(e)[:200]}`\n\nTry again or check /health.",
-            parse_mode="Markdown",
-        )
+        error_msg = f"⚠️ Something went wrong: `{str(e)[:200]}`\n\nTry again or check /health."
+        _save_message("assistant", error_msg)
+        await processing_msg.edit_text(error_msg, parse_mode="Markdown")
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -138,26 +237,44 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
 def _classify_intent(text: str) -> str:
     """
-    Simple keyword-based intent classification.
-    Claude handles the actual NLU; this is just routing.
+    Keyword-based intent classification with conversation-aware fallbacks.
     """
-    text_lower = text.lower()
+    text_lower = text.lower().strip()
+
+    # Short confirmations that refer to last draft
+    send_now_phrases = [
+        "send", "send it", "send that", "yes send", "send that email",
+        "go ahead", "looks good send it", "yes", "ship it", "fire it off",
+        "send the email", "new message send that email",
+    ]
+    if text_lower in send_now_phrases or (len(text_lower) < 30 and "send" in text_lower):
+        # Check if there's a pending draft to send
+        last_id = _get_last_draft_id()
+        if last_id:
+            return "send_last"
 
     summarise_keywords = ["summarise", "summarize", "inbox", "what's new", "what's in", "check email", "brief", "what came in"]
     reply_keywords = ["reply", "respond", "reply to"]
-    compose_keywords = ["email", "send", "draft", "write", "forward", "compose", "message"]
+    compose_keywords = ["email", "draft", "write", "forward", "compose"]
     memory_keywords = ["remember", "update", "note that", "save that", "forget"]
     followup_keywords = ["follow up", "followup", "follow-up", "remind me", "ping me", "check back", "nudge"]
+
+    # Edit-last-draft detection
+    edit_phrases = ["make it shorter", "make it longer", "more casual", "more formal",
+                    "change the tone", "rewrite", "try again", "too long", "too short",
+                    "tweak it", "adjust"]
+    if any(p in text_lower for p in edit_phrases):
+        last_id = _get_last_draft_id()
+        if last_id:
+            return "edit_last"
 
     if any(k in text_lower for k in summarise_keywords):
         return "summarise"
     if any(k in text_lower for k in followup_keywords):
         return "followup"
-    # "reply to X" = reply to existing thread; "email X about Y" = compose new
     if any(k in text_lower for k in reply_keywords):
         return "draft"
     if any(k in text_lower for k in compose_keywords):
-        # If there's an @ sign, it's likely a compose (new email to someone)
         if "@" in text_lower:
             return "compose"
         return "draft"
@@ -173,16 +290,20 @@ async def _handle_summarise(text: str) -> str:
 
 
 async def _handle_query(text: str) -> str:
-    """Answer a question about a contact, deal, or thread."""
+    """Answer a question about a contact, deal, or thread — with conversation history."""
     from app.workflows.inbox import retrieve_context_for_query
-    context = await retrieve_context_for_query(text)
-    return await ask_claude(text, context=context)
+    db_context = await retrieve_context_for_query(text)
+
+    # Add conversation history
+    history = _load_conversation_history(limit=20)
+    history_context = _format_history_for_context(history)
+    full_context = f"{history_context}\n\n{db_context}" if history_context else db_context
+
+    return await ask_claude(text, context=full_context)
 
 
 async def _handle_draft(text: str, update: Update) -> str:
-    """
-    Draft a reply and present it with Send/Edit/Skip keyboard.
-    """
+    """Draft a reply and present it with Send/Edit/Skip keyboard."""
     from app.workflows.draft import draft_reply
     import uuid
 
@@ -199,20 +320,18 @@ async def _handle_draft(text: str, update: Update) -> str:
         f"Subject: _{result['subject']}_"
     )
 
-    # Send with confirmation keyboard
+    _save_message("assistant", f"[Drafted reply to {result.get('to_name', result['to'])}] {result['body'][:200]}")
+
     await update.message.reply_text(
         preview,
         parse_mode="Markdown",
         reply_markup=send_confirmation_keyboard(draft_id),
     )
-    return ""  # Main response already sent via reply_markup
+    return ""
 
 
 async def _handle_memory_update(text: str) -> str:
-    """
-    Parse a memory update instruction, extract structured data via Claude,
-    and persist it to Supabase.
-    """
+    """Parse a memory update, extract structured data, persist to Supabase."""
     from datetime import datetime, timezone
 
     extraction_prompt = (
@@ -228,7 +347,6 @@ async def _handle_memory_update(text: str) -> str:
     raw = await ask_claude(extraction_prompt, max_tokens=300)
 
     try:
-        import json
         data = json.loads(raw.strip().removeprefix("```json").removesuffix("```").strip())
     except (json.JSONDecodeError, ValueError):
         return f"I understood your request but couldn't parse it into a structured update. Here's what I got:\n\n{raw}"
@@ -240,22 +358,18 @@ async def _handle_memory_update(text: str) -> str:
     summary = data.get("summary", "Update saved.")
 
     if record_type == "contact" and name:
-        # Upsert contact
         existing = client.table("contacts").select("*").ilike("name", name).maybe_single().execute()
         if existing.data:
             client.table("contacts").update(updates).eq("id", existing.data["id"]).execute()
         else:
             client.table("contacts").insert({"name": name, **updates}).execute()
-
     elif record_type == "deal" and name:
         existing = client.table("deals").select("*").ilike("name", name).maybe_single().execute()
         if existing.data:
             client.table("deals").update(updates).eq("id", existing.data["id"]).execute()
         else:
             client.table("deals").insert({"name": name, **updates}).execute()
-
     else:
-        # Store as a note in system_state
         note_key = f"note:{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
         client.table("system_state").upsert({
             "key": note_key,
@@ -266,27 +380,21 @@ async def _handle_memory_update(text: str) -> str:
 
 
 async def _handle_compose(text: str, update: Update) -> str:
-    """
-    Compose and send a brand-new email (not a reply to an existing thread).
-    Extracts recipient, subject, and generates body via Claude.
-    """
+    """Compose a brand-new email with Send/Edit/Skip buttons."""
     import uuid
     import re
 
-    # Extract email address from the message
     email_match = re.search(r'[\w.+-]+@[\w-]+\.[\w.-]+', text)
     if not email_match:
         return "I couldn't find an email address in your message. Try: 'Email john@example.com about ...'"
 
     to_email = email_match.group(0)
 
-    # Look up contact for context
     client = get_supabase()
     contact_result = client.table("contacts").select("*").eq("email", to_email.lower()).maybe_single().execute()
     contact = contact_result.data if contact_result and contact_result.data else None
     to_name = contact["name"] if contact else to_email.split("@")[0].title()
 
-    # Load tone samples
     category = "formal_external"
     if contact and contact.get("importance", 3) < 4:
         category = "quick_internal"
@@ -314,11 +422,16 @@ async def _handle_compose(text: str, update: Update) -> str:
         if contact.get("notes"):
             contact_context += f"\nNotes: {contact['notes']}"
 
+    # Include conversation history so Claude knows prior context
+    history = _load_conversation_history(limit=10)
+    history_context = _format_history_for_context(history)
+
     prompt = (
         f"Garret wants to send a NEW email (not a reply).\n"
         f"Instruction: {text}\n"
         f"Recipient: {to_name} <{to_email}>\n"
         f"{contact_context}\n{tone_context}\n\n"
+        f"{history_context}\n\n"
         "Generate TWO things, separated by the exact marker '---SUBJECT---':\n"
         "1. A short email subject line\n"
         "2. The email body\n\n"
@@ -334,18 +447,15 @@ async def _handle_compose(text: str, update: Update) -> str:
 
     raw = await ask_claude_complex(prompt, max_tokens=800)
 
-    # Parse subject and body
     if "---SUBJECT---" in raw:
         parts = raw.split("---SUBJECT---", 1)
         subject = parts[0].strip()
         body = parts[1].strip()
     else:
-        # Fallback: first line is subject
         lines = raw.strip().split("\n", 1)
         subject = lines[0].strip()
         body = lines[1].strip() if len(lines) > 1 else raw.strip()
 
-    # Clean up subject (remove "Subject:" prefix if Claude added it)
     subject = subject.removeprefix("Subject:").strip()
 
     draft_id = str(uuid.uuid4())[:8]
@@ -354,7 +464,7 @@ async def _handle_compose(text: str, update: Update) -> str:
         "to": to_email,
         "to_name": to_name,
         "subject": subject,
-        "thread_id": None,  # New email, no thread
+        "thread_id": None,
         "in_reply_to": None,
         "is_new": True,
     }
@@ -366,19 +476,122 @@ async def _handle_compose(text: str, update: Update) -> str:
         f"`{body}`"
     )
 
+    _save_message("assistant", f"[Drafted new email to {to_name}] Subject: {subject}\n{body[:200]}")
+
     await update.message.reply_text(
         preview,
         parse_mode="Markdown",
         reply_markup=send_confirmation_keyboard(draft_id),
     )
-    return ""  # Already sent via reply_text
+    return ""
+
+
+async def _handle_send_last(text: str, update: Update) -> str:
+    """Send the most recently drafted email when user says 'send' or 'send that'."""
+    draft_id = _get_last_draft_id()
+    if not draft_id:
+        return "No pending draft to send. Draft an email first, then say 'send'."
+
+    draft = _load_draft(draft_id)
+    if not draft:
+        return "The last draft has expired. Try drafting it again."
+
+    try:
+        from datetime import datetime, timezone
+
+        if draft.get("is_new") or not draft.get("thread_id"):
+            from app.gmail.client import send_new_email
+            message_id = await send_new_email(
+                to=draft["to"],
+                subject=draft["subject"],
+                body=draft["body"],
+            )
+        else:
+            from app.gmail.client import send_reply
+            message_id = await send_reply(
+                thread_id=draft["thread_id"],
+                message_id=draft["in_reply_to"],
+                to=draft["to"],
+                subject=draft["subject"],
+                body=draft["body"],
+            )
+
+        # Audit log
+        client = get_supabase()
+        client.table("audit_log").insert({
+            "action": "email_sent",
+            "gmail_message_id": message_id,
+            "recipient": draft["to"],
+            "subject": draft["subject"],
+            "confirmed_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+
+        return f"✅ *Sent* to {draft.get('to_name', draft['to'])}."
+    except Exception as e:
+        logger.error("Email send failed", error=str(e))
+        return f"❌ Failed to send: `{str(e)[:200]}`"
+
+
+async def _handle_edit_last(text: str, update: Update) -> str:
+    """Re-draft the last email based on user's feedback (e.g., 'make it shorter')."""
+    draft_id = _get_last_draft_id()
+    if not draft_id:
+        return "No recent draft to edit. Draft an email first."
+
+    # Load without deleting (peek)
+    client = get_supabase()
+    result = client.table("system_state").select("value").eq("key", f"draft:{draft_id}").maybe_single().execute()
+    if not result.data:
+        return "The last draft has expired. Try drafting it again."
+
+    old_draft = result.data["value"]
+
+    # Load conversation history for context
+    history = _load_conversation_history(limit=10)
+    history_context = _format_history_for_context(history)
+
+    prompt = (
+        f"Here is an email draft that Garret wants you to revise:\n\n"
+        f"To: {old_draft.get('to_name', old_draft['to'])}\n"
+        f"Subject: {old_draft['subject']}\n"
+        f"Body:\n{old_draft['body']}\n\n"
+        f"Garret's feedback: {text}\n\n"
+        f"{history_context}\n\n"
+        "Rewrite the email body incorporating the feedback. "
+        "Return ONLY the revised email body — no subject line, no explanation.\n"
+        "CRITICAL: Write in natural sentences and short paragraphs. NEVER use bullet points, "
+        "dashes, numbered lists, or structured formatting. Sound warm and human."
+    )
+
+    new_body = await ask_claude_complex(prompt, max_tokens=800)
+
+    # Update the draft
+    import uuid
+    new_draft_id = str(uuid.uuid4())[:8]
+    new_draft = {**old_draft, "body": new_body.strip()}
+
+    # Delete old draft, store new one
+    _delete_draft(draft_id)
+    _store_draft(new_draft_id, new_draft)
+
+    preview = (
+        f"*Revised draft to {new_draft.get('to_name', new_draft['to'])}:*\n\n"
+        f"Subject: _{new_draft['subject']}_\n\n"
+        f"`{new_draft['body']}`"
+    )
+
+    _save_message("assistant", f"[Revised draft] {new_draft['body'][:200]}")
+
+    await update.message.reply_text(
+        preview,
+        parse_mode="Markdown",
+        reply_markup=send_confirmation_keyboard(new_draft_id),
+    )
+    return ""
 
 
 async def _handle_followup(text: str) -> str:
-    """
-    Parse a follow-up instruction like "Follow up with Doug in 3 days"
-    and create a scheduled reminder in system_state.
-    """
+    """Parse a follow-up instruction and create a scheduled reminder."""
     from datetime import datetime, timezone, timedelta
 
     extraction_prompt = (
@@ -398,7 +611,7 @@ async def _handle_followup(text: str) -> str:
     try:
         data = json.loads(raw.strip().removeprefix("```json").removesuffix("```").strip())
     except (json.JSONDecodeError, ValueError):
-        return f"I understood the follow-up request but couldn't parse the timing. Try: 'Follow up with Doug in 3 days about the memo.'"
+        return "I understood the follow-up request but couldn't parse the timing. Try: 'Follow up with Doug in 3 days about the memo.'"
 
     days = data.get("days", 3)
     trigger_at = datetime.now(timezone.utc) + timedelta(days=days)
@@ -437,7 +650,6 @@ async def _execute_send(draft_id: str, query) -> None:
         from datetime import datetime, timezone
 
         if draft.get("is_new") or not draft.get("thread_id"):
-            # New email (compose)
             from app.gmail.client import send_new_email
             message_id = await send_new_email(
                 to=draft["to"],
@@ -445,7 +657,6 @@ async def _execute_send(draft_id: str, query) -> None:
                 body=draft["body"],
             )
         else:
-            # Reply to existing thread
             from app.gmail.client import send_reply
             message_id = await send_reply(
                 thread_id=draft["thread_id"],
@@ -464,6 +675,8 @@ async def _execute_send(draft_id: str, query) -> None:
             "subject": draft["subject"],
             "confirmed_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
+
+        _save_message("assistant", f"✅ Sent email to {draft.get('to_name', draft['to'])}")
 
         await query.edit_message_text(
             f"✅ *Sent* to {draft.get('to_name', draft['to'])}.",
