@@ -115,6 +115,17 @@ async def gmail_oauth_callback(code: str, state: str | None = None):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# ─── OAuth Start (re-authorize with new scopes) ─────────────────────────────
+
+@app.get("/gmail/oauth/start")
+async def gmail_oauth_start():
+    """Redirect to Google OAuth consent screen. Used for initial auth and re-auth with new scopes."""
+    from app.gmail.auth import get_auth_url
+    from fastapi.responses import RedirectResponse
+    url = get_auth_url()
+    return RedirectResponse(url=url)
+
+
 # ─── Debug Routes (only in debug mode) ───────────────────────────────────────
 
 if settings.debug:
