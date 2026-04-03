@@ -387,7 +387,7 @@ async def _handle_create_event(text: str) -> str:
         '- "date": date in YYYY-MM-DD format\n'
         '- "start_hour": start hour (24h format, integer)\n'
         '- "start_minute": start minute (integer, default 0)\n'
-        '- "duration_minutes": duration in minutes (default 60)\n'
+        '- "duration_minutes": duration in minutes (default 30)\n'
         '- "attendees": list of email addresses (or empty list)\n'
         '- "location": location string (or empty string)\n'
         '- "description": brief description (or empty string)\n\n'
@@ -412,7 +412,7 @@ async def _handle_create_event(text: str) -> str:
             data.get("start_hour", 10), data.get("start_minute", 0),
             tzinfo=tz,
         )
-        end_time = start_time + timedelta(minutes=data.get("duration_minutes", 60))
+        end_time = start_time + timedelta(minutes=data.get("duration_minutes", 30))
 
         result = await create_event(
             summary=data.get("summary", "Meeting"),
