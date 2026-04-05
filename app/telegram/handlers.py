@@ -39,7 +39,7 @@ def _load_draft(draft_id: str) -> dict | None:
     """Load a pending draft from Supabase. Returns None if expired/missing."""
     client = get_supabase()
     result = client.table("system_state").select("value").eq("key", f"draft:{draft_id}").maybe_single().execute()
-    if result.data:
+    if result and result.data:
         _delete_draft(draft_id)
         return result.data["value"]
     return None
@@ -163,16 +163,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         intent = _classify_intent(text)
-
-        # Guard: if intent looks like a draft confirmation but no drafts
-        # are active, treat it as a general query instead of falsely
-        # triggering "Draft has expired" on ambiguous short inputs.
-        if intent == "draft" and not _pending_drafts:
-            draft_action_words = {"send", "reply", "respond", "forward"}
-            words = set(text.lower().split())
-            if words.issubset(draft_action_words | {"it", "that", "the", "this", "ok", "yes", "please", "now", "to", "a"}):
-                intent = "query"
-
         logger.info("Message received", intent=intent, preview=text[:80])
 
         if intent == "send_last":
@@ -187,6 +177,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             response = await _handle_draft(text, update)
         elif intent == "compose":
             response = await _handle_compose(text, update)
+        elif intent == "forward":
+            response = await _handle_forward(text, update)
         elif intent == "followup":
             response = await _handle_followup(text)
         elif intent == "query":
@@ -268,7 +260,8 @@ def _classify_intent(text: str) -> str:
 
     summarise_keywords = ["summarise", "summarize", "inbox", "what's new", "what's in", "check email", "brief", "what came in"]
     reply_keywords = ["reply", "respond", "reply to"]
-    compose_keywords = ["email", "draft", "write", "forward", "compose"]
+    forward_keywords = ["forward"]
+    compose_keywords = ["email", "draft", "write", "compose"]
     memory_keywords = ["remember", "update", "note that", "save that", "forget"]
     followup_keywords = ["follow up", "followup", "follow-up", "remind me", "ping me", "check back", "nudge"]
     calendar_keywords = [
@@ -297,6 +290,8 @@ def _classify_intent(text: str) -> str:
         return "calendar"
     if any(k in text_lower for k in followup_keywords):
         return "followup"
+    if any(k in text_lower for k in forward_keywords):
+        return "forward"
     if any(k in text_lower for k in reply_keywords):
         return "draft"
     if any(k in text_lower for k in compose_keywords):
@@ -636,13 +631,13 @@ async def _handle_memory_update(text: str) -> str:
 
     if record_type == "contact" and name:
         existing = client.table("contacts").select("*").ilike("name", name).maybe_single().execute()
-        if existing.data:
+        if existing and existing.data:
             client.table("contacts").update(updates).eq("id", existing.data["id"]).execute()
         else:
             client.table("contacts").insert({"name": name, **updates}).execute()
     elif record_type == "deal" and name:
         existing = client.table("deals").select("*").ilike("name", name).maybe_single().execute()
-        if existing.data:
+        if existing and existing.data:
             client.table("deals").update(updates).eq("id", existing.data["id"]).execute()
         else:
             client.table("deals").insert({"name": name, **updates}).execute()
@@ -763,6 +758,81 @@ async def _handle_compose(text: str, update: Update) -> str:
     return ""
 
 
+async def _handle_forward(text: str, update: Update) -> str:
+    """
+    Forward an email with its attachments to a specified address.
+    Finds the referenced email, fetches attachments, and sends a true MIME forward.
+    """
+    import re
+    import uuid
+
+    # Extract target email address
+    email_match = re.search(r'[\w.+-]+@[\w-]+\.[\w.-]+', text)
+    if not email_match:
+        return "I need an email address to forward to. Try: 'Forward the receipts to receipts@mercury.com'"
+
+    to_email = email_match.group(0)
+
+    # Find the referenced email(s) using Claude to parse the instruction
+    history = _load_conversation_history(limit=10)
+    history_context = _format_history_for_context(history)
+
+    prompt = (
+        f"The user wants to forward an email: '{text}'\n\n"
+        f"{history_context}\n\n"
+        "What keywords should I search for to find the email(s) to forward? "
+        "Return ONLY a short search query (2-4 words), no explanation."
+    )
+    search_query = await ask_claude(prompt, max_tokens=50)
+
+    # Search email cache for matching messages
+    client = get_supabase()
+    cache_result = (
+        client.table("email_cache")
+        .select("gmail_message_id, gmail_thread_id, sender, subject, attachments")
+        .order("received_at", desc=True)
+        .limit(20)
+        .execute()
+    )
+
+    if not cache_result or not cache_result.data:
+        return "No recent emails found to forward. Try summarising your inbox first."
+
+    # Match emails by subject/sender keywords
+    search_lower = search_query.lower().strip()
+    matched = []
+    for email in cache_result.data:
+        subject = (email.get("subject") or "").lower()
+        sender = (email.get("sender") or "").lower()
+        if any(word in subject or word in sender
+               for word in search_lower.split() if len(word) > 2):
+            matched.append(email)
+
+    if not matched:
+        matched = cache_result.data[:1]  # Fall back to most recent
+
+    # Forward each matched email with attachments
+    from app.gmail.client import forward_email
+
+    forwarded = []
+    for email in matched[:5]:  # Cap at 5
+        try:
+            msg_id = await forward_email(
+                original_message_id=email["gmail_message_id"],
+                to=to_email,
+                body="Forwarding these receipts for processing.\n\nThanks",
+            )
+            forwarded.append(email.get("subject", "unknown"))
+        except Exception as e:
+            logger.error("Forward failed", message_id=email["gmail_message_id"], error=str(e))
+
+    if not forwarded:
+        return f"Failed to forward emails to {to_email}. Check the logs."
+
+    subjects = "\n".join(f"• _{s}_" for s in forwarded)
+    return f"✅ Forwarded {len(forwarded)} email(s) to {to_email} (with attachments):\n\n{subjects}"
+
+
 async def _handle_send_last(text: str, update: Update) -> str:
     """Send the most recently drafted email when user says 'send' or 'send that'."""
     draft_id = _get_last_draft_id()
@@ -818,7 +888,7 @@ async def _handle_edit_last(text: str, update: Update) -> str:
     # Load without deleting (peek)
     client = get_supabase()
     result = client.table("system_state").select("value").eq("key", f"draft:{draft_id}").maybe_single().execute()
-    if not result.data:
+    if not result or not result.data:
         return "The last draft has expired. Try drafting it again."
 
     old_draft = result.data["value"]

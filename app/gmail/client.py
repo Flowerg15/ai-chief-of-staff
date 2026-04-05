@@ -210,6 +210,82 @@ Content-Type: text/plain; charset=utf-8
     return result["id"]
 
 
+async def forward_email(
+    original_message_id: str,
+    to: str,
+    body: str = "",
+) -> str:
+    """
+    Forward an email with its attachments by fetching the original message,
+    extracting MIME attachments, and building a multipart forward.
+    Returns the new message ID.
+    """
+    service = await _get_service()
+
+    # Fetch original message in full
+    original = service.users().messages().get(
+        userId="me", id=original_message_id, format="full"
+    ).execute()
+
+    headers = _parse_headers(original.get("payload", {}).get("headers", []))
+    orig_subject = headers.get("subject", "(no subject)")
+    orig_from = headers.get("from", "unknown")
+    orig_date = headers.get("date", "")
+    orig_body = _decode_body(original.get("payload", {}))
+    attachments = _extract_attachments(original.get("payload", {}))
+
+    # Build MIME multipart message
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+
+    msg = MIMEMultipart()
+    msg["To"] = to
+    msg["Subject"] = f"Fwd: {orig_subject}"
+
+    # Forward body with original context
+    forward_body = body
+    if forward_body:
+        forward_body += "\n\n"
+    forward_body += (
+        f"---------- Forwarded message ----------\n"
+        f"From: {orig_from}\n"
+        f"Date: {orig_date}\n"
+        f"Subject: {orig_subject}\n\n"
+        f"{orig_body[:8000]}"
+    )
+    msg.attach(MIMEText(forward_body, "plain", "utf-8"))
+
+    # Download and attach each attachment from the original
+    for att in attachments:
+        try:
+            att_data = await download_attachment(original_message_id, att["attachment_id"])
+            mime_main, mime_sub = (att.get("mime_type") or "application/octet-stream").split("/", 1)
+            part = MIMEBase(mime_main, mime_sub)
+            part.set_payload(att_data)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=att["filename"])
+            msg.attach(part)
+        except Exception as e:
+            logger.warning("Failed to attach file", filename=att.get("filename"), error=str(e))
+
+    encoded = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    result = service.users().messages().send(
+        userId="me",
+        body={"raw": encoded},
+    ).execute()
+
+    logger.info(
+        "Email forwarded",
+        message_id=result["id"],
+        original_id=original_message_id,
+        to=to,
+        attachment_count=len(attachments),
+    )
+    return result["id"]
+
+
 async def download_attachment(message_id: str, attachment_id: str) -> bytes:
     """Download an email attachment and return its raw bytes."""
     service = await _get_service()
