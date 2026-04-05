@@ -51,6 +51,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         intent = _classify_intent(text)
+
+        # Guard: if intent looks like a draft confirmation but no drafts
+        # are active, treat it as a general query instead of falsely
+        # triggering "Draft has expired" on ambiguous short inputs.
+        if intent == "draft" and not _pending_drafts:
+            draft_action_words = {"send", "reply", "respond", "forward"}
+            words = set(text.lower().split())
+            if words.issubset(draft_action_words | {"it", "that", "the", "this", "ok", "yes", "please", "now", "to", "a"}):
+                intent = "query"
+
         logger.info("Message received", intent=intent, preview=text[:80])
 
         if intent == "summarise":
