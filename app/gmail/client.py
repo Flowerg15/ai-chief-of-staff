@@ -216,59 +216,39 @@ async def forward_email(
     body: str = "",
 ) -> str:
     """
-    Forward an email with its attachments by fetching the original message,
-    extracting MIME attachments, and building a multipart forward.
+    Forward an email by fetching the original raw MIME and attaching it
+    as a message/rfc822 part. This preserves HTML formatting, inline
+    images, and all attachments exactly as they were.
     Returns the new message ID.
     """
     service = await _get_service()
 
-    # Fetch original message in full
-    original = service.users().messages().get(
-        userId="me", id=original_message_id, format="full"
+    # Fetch the original message as raw MIME — preserves everything
+    original_raw = service.users().messages().get(
+        userId="me", id=original_message_id, format="raw"
     ).execute()
+    original_bytes = base64.urlsafe_b64decode(original_raw["raw"] + "==")
 
-    headers = _parse_headers(original.get("payload", {}).get("headers", []))
-    orig_subject = headers.get("subject", "(no subject)")
-    orig_from = headers.get("from", "unknown")
-    orig_date = headers.get("date", "")
-    orig_body = _decode_body(original.get("payload", {}))
-    attachments = _extract_attachments(original.get("payload", {}))
+    # Parse original to extract subject for the Fwd: header
+    original_mime = email_lib.message_from_bytes(original_bytes)
+    orig_subject = original_mime.get("Subject", "(no subject)")
 
-    # Build MIME multipart message
+    # Build the forwarding envelope
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
-    from email.mime.base import MIMEBase
-    from email import encoders
+    from email.mime.message import MIMEMessage
 
     msg = MIMEMultipart()
     msg["To"] = to
     msg["Subject"] = f"Fwd: {orig_subject}"
 
-    # Forward body with original context
-    forward_body = body
-    if forward_body:
-        forward_body += "\n\n"
-    forward_body += (
-        f"---------- Forwarded message ----------\n"
-        f"From: {orig_from}\n"
-        f"Date: {orig_date}\n"
-        f"Subject: {orig_subject}\n\n"
-        f"{orig_body[:8000]}"
-    )
-    msg.attach(MIMEText(forward_body, "plain", "utf-8"))
+    # Cover note
+    if body:
+        msg.attach(MIMEText(body, "plain", "utf-8"))
 
-    # Download and attach each attachment from the original
-    for att in attachments:
-        try:
-            att_data = await download_attachment(original_message_id, att["attachment_id"])
-            mime_main, mime_sub = (att.get("mime_type") or "application/octet-stream").split("/", 1)
-            part = MIMEBase(mime_main, mime_sub)
-            part.set_payload(att_data)
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", "attachment", filename=att["filename"])
-            msg.attach(part)
-        except Exception as e:
-            logger.warning("Failed to attach file", filename=att.get("filename"), error=str(e))
+    # Attach the entire original message as message/rfc822
+    # This preserves HTML, inline images, and all attachments
+    msg.attach(MIMEMessage(original_mime))
 
     encoded = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
     result = service.users().messages().send(
@@ -281,7 +261,6 @@ async def forward_email(
         message_id=result["id"],
         original_id=original_message_id,
         to=to,
-        attachment_count=len(attachments),
     )
     return result["id"]
 
