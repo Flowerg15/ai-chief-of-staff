@@ -252,7 +252,9 @@ def _classify_intent(text: str) -> str:
         "go ahead", "looks good send it", "yes", "ship it", "fire it off",
         "send the email", "new message send that email",
     ]
-    if text_lower in send_now_phrases or (len(text_lower) < 30 and "send" in text_lower):
+    negations = ["didn't", "didnt", "don't", "dont", "not", "no", "never", "wasn't", "cancel", "stop", "undo"]
+    has_negation = any(neg in text_lower for neg in negations)
+    if not has_negation and (text_lower in send_now_phrases or (len(text_lower) < 30 and "send" in text_lower)):
         # Check if there's a pending draft to send
         last_id = _get_last_draft_id()
         if last_id:
