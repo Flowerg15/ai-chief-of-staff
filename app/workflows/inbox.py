@@ -19,7 +19,7 @@ from app.claude.prompts import build_inbox_context, build_query_context
 logger = structlog.get_logger(__name__)
 
 
-async def summarise_inbox(hours: int = 48) -> str:
+async def summarise_inbox(hours: int = 48, **kwargs) -> str:
     """
     Fetch recent emails, build context, and return a Claude summary.
     Called both on-demand ('Summarise my inbox') and by the daily brief.
