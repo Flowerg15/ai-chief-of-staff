@@ -20,4 +20,4 @@ async def get_system_value(key: str) -> dict | None:
     """Retrieve a value from system_state."""
     client = get_supabase()
     result = client.table("system_state").select("value").eq("key", key).maybe_single().execute()
-    return result.data["value"] if result.data else None
+    return result.data["value"] if result and result.data else None

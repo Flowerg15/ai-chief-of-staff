@@ -50,7 +50,7 @@ async def draft_reply(instruction: str) -> dict | None:
     deal = None
     if thread_db.get("deal_id"):
         deal_result = client.table("deals").select("*").eq("id", thread_db["deal_id"]).maybe_single().execute()
-        deal = deal_result.data
+        deal = deal_result.data if deal_result else None
 
     # Step 5: Load tone samples matching context
     category = _classify_tone_category(contact, deal)
@@ -161,7 +161,7 @@ async def _load_contact(sender_raw: str) -> dict | None:
 
     client = get_supabase()
     result = client.table("contacts").select("*").eq("email", email).maybe_single().execute()
-    return result.data
+    return result.data if result else None
 
 
 def _classify_tone_category(contact: dict | None, deal: dict | None) -> str:
